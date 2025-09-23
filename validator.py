@@ -174,43 +174,29 @@ def detect_invoice_type(lines, global_cfg):
 
     return None
 
-# ---------- invoice total (FINAL total, scored) ----------
+# ---------- invoice total (simple, "amount"/"due"-first) ----------
 def merge_total_field(vendor_cfg, global_cfg):
     """
     Pull invoice_total rules from vendor YAML if present; otherwise from global.yaml;
-    otherwise use safe defaults. Supports either 'discourage' or 'discourage_words'
-    key names to avoid forcing YAML changes.
+    otherwise use simple defaults. Uses 'ignore_words' (more human) in configs.
     """
     g = (global_cfg.get("fields", {}) or {}).get("invoice_total", {}) or {}
     v = (vendor_cfg.get("fields", {}) or {}).get("invoice_total", {}) or {}
 
     def pick(key, default):
-        # accept both discourage/discount_words and return lower-cased list where needed
-        if key == "discourage":
-            src = v.get("discourage", v.get("discourage_words", g.get("discourage", g.get("discourage_words", default))))
-            return [w.lower() for w in src]
-        if key in ("due_keywords", "net_keywords"):
+        if key in ("keywords_must_include", "ignore_words"):
             src = v.get(key, g.get(key, default))
             return [w.lower() for w in src]
         return v.get(key, g.get(key, default))
 
     return {
-        "anchors": pick("anchors", [
-            "Invoice Amount", "Net Invoice Amount", "Total Due", "Amount Due",
-            "Balance Due", "Grand Total"
-        ]),
-        "regex": pick("regex",
-            r"\$?\s*-?\(?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?"
-        ),
-        "discourage": pick("discourage", [
-            "subtotal", "tax", "sales tax", "shipping", "freight", "handling", "other charges", "misc"
-        ]),
-        "due_keywords": pick("due_keywords", [
-            "total due", "amount due", "balance due", "grand total"
-        ]),
-        "net_keywords": pick("net_keywords", [
-            "net invoice amount", "invoice amount", "net total"
-        ]),
+        # we only care about lines that mention "amount" or "due"
+        "keywords_must_include": pick("keywords_must_include", ["amount", "due"]),
+        # words that look like totals but are not the final total line
+        "ignore_words": pick("ignore_words", ["subtotal", "tax", "shipping", "handling", "freight"]),
+        # money pattern
+        "regex": pick("regex", r"\$?\s*-?\(?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?"),
+        # if value is on the line below the label
         "lookahead_lines": int(v.get("lookahead_lines", g.get("lookahead_lines", 2))),
     }
 
@@ -225,128 +211,55 @@ def _amount_to_number(txt: str) -> float:
     except Exception:
         return float("nan")
 
-def pick_invoice_total(
-    lines,
-    anchors,
-    regex,
-    discourage_words=None,
-    lookahead_lines=2,
-    due_keywords=None,
-    net_keywords=None,
-):
+def pick_invoice_total(lines, keywords_must_include, ignore_words, regex, lookahead_lines=2):
     """
-    Pick the FINAL total (after tax/shipping), not earlier 'net' or 'subtotal'.
-
-    How it decides:
-      - Build candidates from:
-          * anchor hits (same / next lines)
-          * 'due' phrases (Total Due, Grand Total, Amount/Balance Due) -> strong boost
-          * 'net' phrases (Net Invoice Amount, Invoice Amount) -> medium boost
-      - Penalize lines that contain discourage words (subtotal, tax, shipping, etc.).
-      - Prefer totals that appear AFTER nearby mentions of tax/shipping/fees.
-      - Slightly prefer totals later in the document.
-      - Tie-break by higher numeric amount.
+    Very simple rule:
+      - Only consider lines that contain 'amount' or 'due' (case-insensitive).
+      - Ignore lines that contain any word from ignore_words.
+      - Grab the right-most amount on that line; if not found, check next lines.
+      - Prefer the LAST matching line in the document; if tied, take the larger number.
     """
     rx = re.compile(regex)
-    discourage_words = [w.lower() for w in (discourage_words or [])]
-    due_keywords = [w.lower() for w in (due_keywords or [])]
-    net_keywords = [w.lower() for w in (net_keywords or [])]
+    kws = [k.lower() for k in (keywords_must_include or [])]
+    ignores = [w.lower() for w in (ignore_words or [])]
 
     def amounts_in(text):
         hits = rx.findall(text)
         return [(h if isinstance(h, str) else h[0]).strip() for h in hits]
 
-    # Precompute where “adjusters” (tax/shipping/handling/etc.) appear
-    adjuster_words = set(["tax", "sales tax", "shipping", "freight", "handling", "other charges", "misc"])
-    adjuster_idxs = {i for i, ln in enumerate(lines) if any(w in ln.lower() for w in adjuster_words)}
+    candidates = []  # (amount_text, numeric_value, line_index)
 
-    candidates = []  # (amount_text, value, line_idx, line_text, flags)
-
-    # 1) Anchors -> same line and short lookahead
     for i, ln in enumerate(lines):
         low = ln.lower()
-        if any(dw in low for dw in discourage_words):
-            # this line is suspicious for final totals; skip as anchor host
+        if not any(k in low for k in kws):
             continue
-        hits = [a for a in anchors if a.lower() in low]
-        if not hits:
+        if any(w in low for w in ignores):
             continue
 
-        a = min(hits, key=lambda x: low.find(x.lower()))
-        cut = low.find(a.lower())
-        segment = ln[cut + len(a):]
-        amts = amounts_in(segment)
+        # right-most amount on the same line
+        amts = amounts_in(ln)
         if amts:
-            candidates.append((amts[-1], _amount_to_number(amts[-1]), i, ln, {"anchor": True}))
+            candidates.append((amts[-1], _amount_to_number(amts[-1]), i))
+            continue
+
+        # try the next few lines if number is below the label
         for j in range(1, lookahead_lines + 1):
             if i + j < len(lines):
                 nxt = lines[i + j]
-                if any(dw in nxt.lower() for dw in discourage_words):
+                if any(w in nxt.lower() for w in ignores):
                     continue
                 amts2 = amounts_in(nxt)
                 if amts2:
-                    candidates.append((amts2[-1], _amount_to_number(amts2[-1]), i + j, nxt, {"anchor_next": j}))
-
-    # 2) Total-ish lines (even without anchors)
-    totalish = tuple(set(
-        ["total", "total due", "amount due", "balance due", "grand total",
-         "invoice amount", "net invoice amount"] + due_keywords + net_keywords
-    ))
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if any(t in low for t in totalish):
-            amts = amounts_in(ln)
-            if amts:
-                candidates.append((amts[-1], _amount_to_number(amts[-1]), i, ln, {"totalish": True}))
+                    candidates.append((amts2[-1], _amount_to_number(amts2[-1]), i + j))
+                    break
 
     if not candidates:
-        # 3) Fallback: biggest amount anywhere
-        all_amts = []
-        for i, ln in enumerate(lines):
-            for a in amounts_in(ln):
-                all_amts.append((a, _amount_to_number(a), i, ln, {}))
-        if not all_amts:
-            return None, "total_not_found"
-        best = max(all_amts, key=lambda t: t[1])
-        return best[0], "total_max_in_doc"
+        return None, "total_not_found"
 
-    N = max(1, len(lines))
-
-    def tax_context_bonus(idx: int) -> float:
-        """
-        If there are TAX/SHIPPING/… lines within the previous few lines, we boost,
-        because final totals usually appear AFTER the adjustments.
-        """
-        window = range(max(0, idx - 8), idx + 1)
-        return 3.0 if any(k in adjuster_idxs for k in window) else 0.0
-
-    def score_item(item):
-        amt_txt, val, idx, ln, flags = item
-        low = ln.lower()
-        s = 0.0
-
-        # Strong positives
-        if flags.get("anchor"):      s += 6.0
-        if any(k in low for k in due_keywords): s += 7.0  # “Total Due / Grand Total / Amount Due / Balance Due”
-
-        # Medium positives
-        if flags.get("anchor_next"): s += 3.0
-        if any(k in low for k in net_keywords): s += 3.0  # “Net Invoice Amount / Invoice Amount”
-
-        # Tax/shipping context just above the line => favor this as *final total*
-        s += tax_context_bonus(idx)
-
-        # Negatives
-        if any(dw in low for dw in discourage_words): s -= 6.0
-
-        # Slight preference toward later-in-document totals
-        s += 2.0 * (idx / N)
-
-        return s
-
-    # Choose by (score, value)
-    best = max(candidates, key=lambda it: (score_item(it), it[1]))
-    return best[0], "total_scored_final"
+    # Prefer the last occurrence; tie-break by larger numeric amount
+    candidates.sort(key=lambda t: (t[2], t[1]))  # sort by (line_index, value)
+    best = candidates[-1]
+    return best[0], "amount_due_rule"
 
 # ---------- load configs ----------
 def load_vendor_cfgs():
@@ -374,16 +287,14 @@ def process_pdf(pdf_path: Path):
     vname, _   = detect_vendor_name(lines, vcfg, global_cfg)
     itype      = detect_invoice_type(lines, global_cfg)
 
-    # FINAL total (after tax/shipping) via scored picker
-    tot_field  = merge_total_field(vcfg, global_cfg)
+    # Invoice total via simple "amount/due" rule
+    tot_field = merge_total_field(vcfg, global_cfg)
     inv_total, _ = pick_invoice_total(
         lines,
-        tot_field["anchors"],
+        tot_field["keywords_must_include"],
+        tot_field["ignore_words"],
         tot_field["regex"],
-        discourage_words=tot_field.get("discourage", []),
         lookahead_lines=tot_field.get("lookahead_lines", 2),
-        due_keywords=tot_field.get("due_keywords", []),
-        net_keywords=tot_field.get("net_keywords", []),
     )
 
     return {
