@@ -10,21 +10,47 @@ fields:
     regex: "\\b[A-Za-z]{0,4}[- ]?\\d{4,}\\b"
 
   invoice_total:
-    # We only trust lines that contain one of these words
+    # Only consider lines that mention one of these words
     keywords_must_include:
       - "amount"
       - "due"
-    # Lines to skip even if they look like totals (not the final)
+    # Lines that look like totals but are NOT the final total
     ignore_words:
       - "subtotal"
+      - "sales tax"
       - "tax"
       - "shipping"
-      - "handling"
       - "freight"
-    # Money like $1,234.56 or (1,234.56) or 1,234.56
+      - "handling"
+      - "other charges"
+      - "misc"
+    # Money like 1,234.56 or (1,234.56) or $1,234.56
     regex: "\\$?\\s*-?\\(?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?\\)?"
-    # If the number is on a line below the label
+    # If the number sits on the next line under the label
     lookahead_lines: 2
+
+  invoice_date:
+    # Common labels you’ll see near the invoice date
+    labels:
+      - "Invoice Date"
+      - "Date"
+      - "Inv Date"
+    # MM/DD/YYYY, M/D/YY, or Month DD, YYYY
+    date_regex: "\\b(?:\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|[A-Za-z]{3,9}\\s+\\d{1,2},\\s*\\d{4})\\b"
+    # Words that indicate this date is NOT the invoice date
+    ignore_near:
+      - "due"
+      - "due by"
+      - "ship"
+      - "ship date"
+      - "rental in"
+      - "rental out"
+      - "packed"
+      - "terms"
+    # Look near the top first; most invoices place it there
+    header_zone_lines: 20
+    # If the date is printed on the next line
+    lookahead_lines: 1
 
 vendor_detection:
   remit_headers:
